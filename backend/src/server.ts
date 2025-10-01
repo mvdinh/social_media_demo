@@ -1,5 +1,5 @@
 // ============================================
-// FILE: backend/src/server.ts (CẬP NHẬT)
+// FILE: backend/src/server.ts
 // ============================================
 import express, { Application } from 'express';
 import { createServer } from 'http';
@@ -32,7 +32,8 @@ const httpServer = createServer(app);
 const io = new SocketIOServer(httpServer, {
   cors: {
     origin: process.env.FRONTEND_URL || 'http://localhost:5173',
-    methods: ['GET', 'POST']
+    methods: ['GET', 'POST'],
+    credentials: true
   }
 });
 
@@ -44,7 +45,10 @@ const p2pNetwork = new P2PNetwork();
 (app as any).p2pNetwork = p2pNetwork;
 
 // Middleware
-app.use(cors());
+app.use(cors({
+  origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+  credentials: true
+}));
 app.use(express.json());
 
 // Routes
@@ -55,6 +59,15 @@ app.use('/api/groups', groupRoutes);
 app.use('/api/private-messages', privateMessageRoutes);
 app.use('/api/group-messages', groupMessageRoutes);
 app.use('/api/users', userRoutes);
+
+// Health check
+app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    blockchain: blockchain.chain.length,
+    peers: p2pNetwork.getPeerCount()
+  });
+});
 
 // Store user socket mappings
 const userSockets = new Map<string, string>(); // userId -> socketId
@@ -117,9 +130,16 @@ io.on('connection', (socket) => {
       const onlineUsers = await UserStatus.find({ status: 'online' });
       socket.emit('onlineUsers', onlineUsers);
 
+      // Gửi peer update
+      io.emit('peerUpdate', {
+        peerCount: p2pNetwork.getPeerCount(),
+        peers: p2pNetwork.getPeers()
+      });
+
       console.log(`✅ User authenticated: ${currentUsername} (${currentUserId})`);
     } catch (error) {
       console.error('Authentication error:', error);
+      socket.emit('error', { message: 'Authentication failed' });
     }
   });
 
@@ -175,10 +195,10 @@ io.on('connection', (socket) => {
   });
 
   // Gửi tin nhắn riêng tư
-  socket.on('sendPrivateMessage', async (data: { 
-    receiverId: string; 
+  socket.on('sendPrivateMessage', async (data: {
+    receiverId: string;
     receiverUsername: string;
-    content: string 
+    content: string
   }) => {
     try {
       if (!currentUserId || !currentUsername) {
@@ -238,9 +258,9 @@ io.on('connection', (socket) => {
   });
 
   // Gửi tin nhắn nhóm
-  socket.on('sendGroupMessage', async (data: { 
+  socket.on('sendGroupMessage', async (data: {
     groupId: string;
-    content: string 
+    content: string
   }) => {
     try {
       if (!currentUserId || !currentUsername) {
@@ -346,4 +366,96 @@ io.on('connection', (socket) => {
       });
     } else if (data.groupId) {
       // Group chat typing
-      socket.to(`group_${data.groupI
+      socket.to(`group_${data.groupId}`).emit('userTyping', {
+        groupId: data.groupId,
+        username: currentUsername
+      });
+    }
+  });
+
+  // User ngừng gõ
+  socket.on('stopTyping', (data: { conversationId?: string; groupId?: string }) => {
+    if (!currentUsername) return;
+
+    if (data.conversationId) {
+      const [user1, user2] = data.conversationId.split('_');
+      const otherUserId = user1 === currentUserId ? user2 : user1;
+      io.to(`user_${otherUserId}`).emit('userStoppedTyping', {
+        conversationId: data.conversationId,
+        username: currentUsername
+      });
+    } else if (data.groupId) {
+      socket.to(`group_${data.groupId}`).emit('userStoppedTyping', {
+        groupId: data.groupId,
+        username: currentUsername
+      });
+    }
+  });
+
+  // Join group room (khi được thêm vào nhóm)
+  socket.on('joinGroup', (data: { groupId: string }) => {
+    socket.join(`group_${data.groupId}`);
+    console.log(`User ${currentUsername} joined group ${data.groupId}`);
+  });
+
+  // Leave group room
+  socket.on('leaveGroup', (data: { groupId: string }) => {
+    socket.leave(`group_${data.groupId}`);
+    console.log(`User ${currentUsername} left group ${data.groupId}`);
+  });
+
+  // Xử lý disconnect
+  socket.on('disconnect', async () => {
+    console.log('❌ User disconnected:', socket.id);
+
+    if (currentUserId) {
+      // Xóa socket mapping
+      userSockets.delete(currentUserId);
+
+      // Cập nhật user status
+      await UserStatus.findOneAndUpdate(
+        { userId: currentUserId },
+        {
+          status: 'offline',
+          lastSeen: new Date(),
+          socketId: null
+        }
+      );
+
+      // Broadcast user offline status
+      io.emit('userStatusUpdate', {
+        userId: currentUserId,
+        username: currentUsername,
+        status: 'offline',
+        lastSeen: new Date()
+      });
+    }
+
+    p2pNetwork.removePeer(socket.id);
+
+    io.emit('peerUpdate', {
+      peerCount: p2pNetwork.getPeerCount(),
+      peers: p2pNetwork.getPeers()
+    });
+  });
+});
+
+// Error handling middleware
+app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  console.error('Error:', err);
+  res.status(500).json({ error: 'Internal server error' });
+});
+
+// Kết nối database và khởi động server
+const PORT = process.env.PORT || 5000;
+
+connectDatabase().then(() => {
+  httpServer.listen(PORT, () => {
+    console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`⛓️  Blockchain initialized with ${blockchain.chain.length} blocks`);
+    console.log(`🌐 Frontend URL: ${process.env.FRONTEND_URL || 'http://localhost:5173'}`);
+  });
+}).catch((error) => {
+  console.error('Failed to start server:', error);
+  process.exit(1);
+});
